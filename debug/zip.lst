@@ -1,0 +1,851 @@
+       |// Written in the D programming language.
+       |
+       |/**
+       | * Read/write data in the $(LINK2 http://www.info-_zip.org, zip archive) format.
+       | * Makes use of the etc.c.zlib compression library.
+       | *
+       | * Bugs:
+       | *      $(UL
+       | *      $(LI Multi-disk zips not supported.)
+       | *      $(LI Only Zip version 20 formats are supported.)
+       | *      $(LI Only supports compression modes 0 (no compression) and 8 (deflate).)
+       | *      $(LI Does not support encryption.)
+       | *      $(LI $(BUGZILLA 592))
+       | *      $(LI $(BUGZILLA 1832))
+       | *      $(LI $(BUGZILLA 2137))
+       | *      $(LI $(BUGZILLA 2138))
+       | *      )
+       | *
+       | * Macros:
+       | *      WIKI = Phobos/StdZip
+       | *
+       | * Copyright: Copyright Digital Mars 2000 - 2009.
+       | * License:   $(WEB www.boost.org/LICENSE_1_0.txt, Boost License 1.0).
+       | * Authors:   $(WEB digitalmars.com, Walter Bright)
+       | * Source:    $(PHOBOSSRC std/_zip.d)
+       | */
+       |
+       |/*          Copyright Digital Mars 2000 - 2009.
+       | * Distributed under the Boost Software License, Version 1.0.
+       | *    (See accompanying file LICENSE_1_0.txt or copy at
+       | *          http://www.boost.org/LICENSE_1_0.txt)
+       | */
+       |module std.zip;
+       |
+       |//debug=print;
+       |
+       |/** Thrown on error.
+       | */
+       |class ZipException : Exception
+       |{
+0000000|    this(string msg)
+       |    {
+0000000|        super("ZipException: " ~ msg);
+       |    }
+       |}
+       |
+       |/**
+       | * Compression method used by ArchiveMember
+       | */
+       |enum CompressionMethod : ushort
+       |{
+       |    none = 0,   /// No compression, just archiving
+       |    deflate = 8 /// Deflate algorithm. Use zlib library to compress
+       |}
+       |
+       |/**
+       | * A member of the ZipArchive.
+       | */
+       |final class ArchiveMember
+       |{
+       |    import std.conv : to, octal;
+       |    import std.datetime : DosFileTime, SysTime, SysTimeToDosFileTime;
+       |
+       |    /**
+       |     * Read/Write: Usually the file name of the archive member; it is used to
+       |     * index the archive directory for the member. Each member must have a unique
+       |     * name[]. Do not change without removing member from the directory first.
+       |     */
+       |    string name;
+       |
+       |    ubyte[] extra;              /// Read/Write: extra data for this member.
+       |    string comment;             /// Read/Write: comment associated with this member.
+       |
+       |    private ubyte[] _compressedData;
+       |    private ubyte[] _expandedData;
+       |    private uint offset;
+       |    private uint _crc32;
+       |    private uint _compressedSize;
+       |    private uint _expandedSize;
+       |    private CompressionMethod _compressionMethod;
+       |    private ushort _madeVersion = 20;
+       |    private ushort _extractVersion = 20;
+       |    private ushort _diskNumber;
+       |    private uint _externalAttributes;
+       |    private DosFileTime _time;
+       |
+       |    ushort flags;                  /// Read/Write: normally set to 0
+       |    ushort internalAttributes;     /// Read/Write
+       |
+     86|    @property ushort extractVersion()     { return _extractVersion; }    /// Read Only
+    166|    @property uint crc32()         { return _crc32; }    /// Read Only: cyclic redundancy check (CRC) value
+       |
+       |    // Explicitly undocumented. It will be removed in January 2015.
+       |    deprecated("Please use fileAttributes instead.")
+       |    @property ref inout(ushort) madeVersion() inout @safe pure nothrow
+0000000|    { return _madeVersion; }
+       |
+       |    // Explicitly undocumented. It will be removed in January 2015.
+       |    deprecated("Please use fileAttributes instead.")
+       |    @property ref inout(uint) externalAttributes() inout @safe pure nothrow
+0000000|    { return _externalAttributes; }
+       |
+       |    /// Read Only: size of data of member in compressed form.
+    465|    @property uint compressedSize()     { return _compressedSize; }
+       |
+       |    /// Read Only: size of data of member in expanded form.
+    167|    @property uint expandedSize()     { return _expandedSize; }
+     43|    @property ushort diskNumber()     { return _diskNumber; }        /// Read Only: should be 0.
+       |
+       |    /// Read Only: data of member in compressed form.
+     84|    @property ubyte[] compressedData()     { return _compressedData; }
+       |
+       |    /// Read data of member in uncompressed form.
+    163|    @property ubyte[] expandedData()     { return _expandedData; }
+       |
+       |    /// Write data of member in uncompressed form.
+       |    @property void expandedData(ubyte[] ed)
+       |    {
+     41|        _expandedData = ed;
+     41|        _expandedSize  = to!uint(_expandedData.length);
+       |
+       |        // Clean old compressed data, if any
+     41|        _compressedData.length = 0;
+     41|        _compressedSize = 0;
+       |    }
+       |
+       |    /**
+       |     * Set the OS specific file attributes, as obtained by
+       |     * $(XREF file,getAttributes) or $(XREF file,DirEntry.attributes), for this archive member.
+       |     */
+       |    @property void fileAttributes(uint attr)
+       |    {
+       |        version (Posix)
+       |        {
+       |            _externalAttributes = (attr & 0xFFFF) << 16;
+       |            _madeVersion &= 0x00FF;
+       |            _madeVersion |= 0x0300; // attributes are in UNIX format
+       |        }
+       |        else version (Windows)
+       |        {
+0000000|            _externalAttributes = attr;
+0000000|            _madeVersion &= 0x00FF; // attributes are in MS-DOS and OS/2 format
+       |        }
+       |        else
+       |        {
+       |            static assert(0, "Unimplemented platform");
+       |        }
+       |    }
+       |
+       |    version (Posix) unittest
+       |    {
+       |        auto am = new ArchiveMember();
+       |        am.fileAttributes = octal!100644;
+       |        assert(am._externalAttributes == octal!100644 << 16);
+       |        assert((am._madeVersion & 0xFF00) == 0x0300);
+       |    }
+       |
+       |    /**
+       |     * Get the OS specific file attributes for the archive member.
+       |     *
+       |     * Returns: The file attributes or 0 if the file attributes were
+       |     * encoded for an incompatible OS (Windows vs. Posix).
+       |     *
+       |     */
+       |    @property uint fileAttributes() const
+       |    {
+       |        version (Posix)
+       |        {
+       |            if ((_madeVersion & 0xFF00) == 0x0300)
+       |                return _externalAttributes >> 16;
+       |            return 0;
+       |        }
+       |        else version (Windows)
+       |        {
+0000000|            if ((_madeVersion & 0xFF00) == 0x0000)
+0000000|                return _externalAttributes;
+0000000|            return 0;
+       |        }
+       |        else
+       |        {
+       |            static assert(0, "Unimplemented platform");
+       |        }
+       |    }
+       |
+       |    /// Set the last modification time for this member.
+       |    @property void time(SysTime time)
+       |    {
+0000000|        _time = SysTimeToDosFileTime(time);
+       |    }
+       |
+       |    /// ditto
+       |    @property void time(DosFileTime time)
+       |    {
+     82|        _time = time;
+       |    }
+       |
+       |    /// Get the last modification time for this member.
+       |    @property DosFileTime time() const
+       |    {
+     86|        return _time;
+       |    }
+       |
+       |    /**
+       |     * Read compression method used for this member
+       |     * See_Also:
+       |     *     CompressionMethod
+       |     **/
+     82|    @property CompressionMethod compressionMethod() { return _compressionMethod; }
+       |
+       |    // Explicitly undocumented. It will be removed in January 2015.
+       |    deprecated("Please use the enum CompressionMethod to set this property instead.")
+       |    @property void compressionMethod(ushort cm)
+       |    {
+0000000|        compressionMethod = cast(CompressionMethod)(cm);
+       |    }
+       |
+       |    /**
+       |     * Write compression method used for this member
+       |     * See_Also:
+       |     *     CompressionMethod
+       |     **/
+       |    @property void compressionMethod(CompressionMethod cm)
+       |    {
+     40|        if (cm == _compressionMethod) return;
+       |
+     40|        if (_compressedSize > 0)
+0000000|            throw new ZipException("Can't change compression method for a compressed element");
+       |
+     40|        _compressionMethod = cm;
+       |    }
+       |
+       |    debug(print)
+       |    {
+       |    void print()
+       |    {
+       |        printf("name = '%.*s'\n", name.length, name.ptr);
+       |        printf("\tcomment = '%.*s'\n", comment.length, comment.ptr);
+       |        printf("\tmadeVersion = x%04x\n", _madeVersion);
+       |        printf("\textractVersion = x%04x\n", extractVersion);
+       |        printf("\tflags = x%04x\n", flags);
+       |        printf("\tcompressionMethod = %d\n", compressionMethod);
+       |        printf("\ttime = %d\n", time);
+       |        printf("\tcrc32 = x%08x\n", crc32);
+       |        printf("\texpandedSize = %d\n", expandedSize);
+       |        printf("\tcompressedSize = %d\n", compressedSize);
+       |        printf("\tinternalAttributes = x%04x\n", internalAttributes);
+       |        printf("\texternalAttributes = x%08x\n", externalAttributes);
+       |    }
+       |    }
+       |}
+       |
+       |/**
+       | * Object representing the entire archive.
+       | * ZipArchives are collections of ArchiveMembers.
+       | */
+       |final class ZipArchive
+       |{
+       |    import std.bitmanip : littleEndianToNative, nativeToLittleEndian;
+       |    import std.algorithm : max;
+       |    import std.conv : to;
+       |    import std.zlib : compress;
+       |    import std.datetime : DosFileTime;
+       |
+       |    string comment;     /// Read/Write: the archive comment. Must be less than 65536 bytes in length.
+       |
+       |    private ubyte[] _data;
+       |    private uint endrecOffset;
+       |
+       |    private uint _diskNumber;
+       |    private uint _diskStartDir;
+       |    private uint _numEntries;
+       |    private uint _totalEntries;
+       |    private bool _isZip64;
+       |    static const ushort zip64ExtractVersion = 45;
+       |    static const int digiSignLength = 6;
+       |    static const int eocd64LocLength = 20;
+       |    static const int eocd64Length = 56;
+       |
+       |    /// Read Only: array representing the entire contents of the archive.
+   2117|    @property ubyte[] data()       { return _data; }
+       |
+       |    /// Read Only: 0 since multi-disk zip archives are not supported.
+      7|    @property uint diskNumber()    { return _diskNumber; }
+       |
+       |    /// Read Only: 0 since multi-disk zip archives are not supported
+      6|    @property uint diskStartDir()  { return _diskStartDir; }
+       |
+       |    /// Read Only: number of ArchiveMembers in the directory.
+     62|    @property uint numEntries()    { return _numEntries; }
+     13|    @property uint totalEntries()  { return _totalEntries; }    /// ditto
+       |    
+       |    /// True when the archive is in Zip64 format.
+     20|    @property bool isZip64()  { return _isZip64; }
+       |    
+       |    /// Set this to true to force building a Zip64 archive.
+      2|    @property void isZip64(bool value) { _isZip64 = value; }
+       |    /**
+       |     * Read Only: array indexed by the name of each member of the archive.
+       |     *  All the members of the archive can be accessed with a foreach loop:
+       |     * Example:
+       |     * --------------------
+       |     * ZipArchive archive = new ZipArchive(data);
+       |     * foreach (ArchiveMember am; archive.directory)
+       |     * {
+       |     *     writefln("member name is '%s'", am.name);
+       |     * }
+       |     * --------------------
+       |     */
+     43|    @property ArchiveMember[string] directory() { return _directory; }
+       |
+       |    private ArchiveMember[string] _directory;
+       |
+       |    debug (print)
+       |    {
+       |    void print()
+       |    {
+       |        printf("\tdiskNumber = %u\n", diskNumber);
+       |        printf("\tdiskStartDir = %u\n", diskStartDir);
+       |        printf("\tnumEntries = %u\n", numEntries);
+       |        printf("\ttotalEntries = %u\n", totalEntries);
+       |        printf("\tcomment = '%.*s'\n", comment.length, comment.ptr);
+       |    }
+       |    }
+       |
+       |    /* ============ Creating a new archive =================== */
+       |
+       |    /** Constructor to use when creating a new archive.
+       |     */
+      4|    this()
+       |    {
+       |    }
+       |
+       |    /** Add de to the archive.
+       |     */
+       |    void addMember(ArchiveMember de)
+       |    {
+     42|        _directory[de.name] = de;
+       |    }
+       |
+       |    /** Delete de from the archive.
+       |     */
+       |    void deleteMember(ArchiveMember de)
+       |    {
+0000000|        _directory.remove(de.name);
+       |    }
+       |
+       |    /**
+       |     * Construct an archive out of the current members of the archive.
+       |     *
+       |     * Fills in the properties data[], diskNumber, diskStartDir, numEntries,
+       |     * totalEntries, and directory[].
+       |     * For each ArchiveMember, fills in properties crc32, compressedSize,
+       |     * compressedData[].
+       |     *
+       |     * Returns: array representing the entire archive.
+       |     */
+       |    void[] build()
+      5|    {   uint i;
+      5|        uint directoryOffset;
+       |
+      5|        if (comment.length > 0xFFFF)
+0000000|            throw new ZipException("archive comment longer than 65535");
+       |
+       |        // Compress each member; compute size
+      5|        uint archiveSize = 0;
+      5|        uint directorySize = 0;
+      5|        foreach (ArchiveMember de; _directory)
+       |        {
+     43|            if (!de._compressedData.length)
+       |            {
+     41|                switch (de.compressionMethod)
+       |                {
+      1|                    case CompressionMethod.none:
+      1|                        de._compressedData = de._expandedData;
+      1|                        break;
+       |
+     40|                    case CompressionMethod.deflate:
+     40|                        de._compressedData = cast(ubyte[])std.zlib.compress(cast(void[])de._expandedData);
+     40|                        de._compressedData = de._compressedData[2 .. de._compressedData.length - 4];
+     40|                        break;
+       |
+0000000|                    default:
+0000000|                        throw new ZipException("unsupported compression method");
+       |                }
+       |
+     41|                de._compressedSize = to!uint(de._compressedData.length);
+     41|                de._crc32 = std.zlib.crc32(0, cast(void[])de._expandedData);
+       |            }
+     43|            assert(de._compressedData.length == de._compressedSize);
+       |
+     43|            if (to!ulong(archiveSize) + 30 + de.name.length + de.extra.length + de.compressedSize
+       |                    + directorySize + 46 + de.name.length + de.extra.length + de.comment.length
+       |                    + 22 + comment.length + eocd64LocLength + eocd64Length > uint.max)
+0000000|                throw new ZipException("zip files bigger than 4 GB are unsupported");
+       |            
+     43|            archiveSize += 30 + de.name.length +
+       |                                de.extra.length +
+       |                                de.compressedSize;
+     43|            directorySize += 46 + de.name.length +
+       |                                de.extra.length +
+       |                                de.comment.length;
+       |        }
+       |
+      9|        if (!isZip64 && _directory.length > ushort.max)
+0000000|            _isZip64 = true;
+      5|        uint dataSize = archiveSize + directorySize + 22 + cast(uint)comment.length;
+      5|        if (isZip64)
+      1|            dataSize += eocd64LocLength + eocd64Length;
+       |        
+      5|        _data = new ubyte[dataSize];
+       |
+       |        // Populate the data[]
+       |
+       |        // Store each archive member
+      5|        i = 0;
+      5|        foreach (ArchiveMember de; _directory)
+       |        {
+     43|            de.offset = i;
+     43|            _data[i .. i + 4] = cast(ubyte[])"PK\x03\x04";
+     43|            putUshort(i + 4,  de.extractVersion);
+     43|            putUshort(i + 6,  de.flags);
+     43|            putUshort(i + 8,  de._compressionMethod);
+     43|            putUint  (i + 10, cast(uint)de.time);
+     43|            putUint  (i + 14, de.crc32);
+     43|            putUint  (i + 18, de.compressedSize);
+     43|            putUint  (i + 22, to!uint(de.expandedSize));
+     43|            putUshort(i + 26, cast(ushort)de.name.length);
+     43|            putUshort(i + 28, cast(ushort)de.extra.length);
+     43|            i += 30;
+       |
+     43|            _data[i .. i + de.name.length] = (cast(ubyte[])de.name)[];
+     43|            i += de.name.length;
+     43|            _data[i .. i + de.extra.length] = (cast(ubyte[])de.extra)[];
+     43|            i += de.extra.length;
+     43|            _data[i .. i + de.compressedSize] = de.compressedData[];
+     43|            i += de.compressedSize;
+       |        }
+       |
+       |        // Write directory
+      5|        directoryOffset = i;
+      5|        _numEntries = 0;
+      5|        foreach (ArchiveMember de; _directory)
+       |        {
+     43|            _data[i .. i + 4] = cast(ubyte[])"PK\x01\x02";
+     43|            putUshort(i + 4,  de._madeVersion);
+     43|            putUshort(i + 6,  de.extractVersion);
+     43|            putUshort(i + 8,  de.flags);
+     43|            putUshort(i + 10, de._compressionMethod);
+     43|            putUint  (i + 12, cast(uint)de.time);
+     43|            putUint  (i + 16, de.crc32);
+     43|            putUint  (i + 20, de.compressedSize);
+     43|            putUint  (i + 24, de.expandedSize);
+     43|            putUshort(i + 28, cast(ushort)de.name.length);
+     43|            putUshort(i + 30, cast(ushort)de.extra.length);
+     43|            putUshort(i + 32, cast(ushort)de.comment.length);
+     43|            putUshort(i + 34, de.diskNumber);
+     43|            putUshort(i + 36, de.internalAttributes);
+     43|            putUint  (i + 38, de._externalAttributes);
+     43|            putUint  (i + 42, de.offset);
+     43|            i += 46;
+       |
+     43|            _data[i .. i + de.name.length] = (cast(ubyte[])de.name)[];
+     43|            i += de.name.length;
+     43|            _data[i .. i + de.extra.length] = (cast(ubyte[])de.extra)[];
+     43|            i += de.extra.length;
+     43|            _data[i .. i + de.comment.length] = (cast(ubyte[])de.comment)[];
+     43|            i += de.comment.length;
+     43|            _numEntries++;
+       |        }
+      5|        _totalEntries = numEntries;
+       |
+      5|        if (isZip64)
+       |        {
+       |            // Write zip64 end of central directory record
+      1|            uint eocd64Offset = i;
+      1|            _data[i .. i + 4] = cast(ubyte[])"PK\x06\x06";
+      1|            putUlong (i + 4,  eocd64Length - 12);
+      1|            putUshort(i + 12, zip64ExtractVersion);
+      1|            putUshort(i + 14, zip64ExtractVersion);
+      1|            putUint  (i + 16, diskNumber);
+      1|            putUint  (i + 20, diskStartDir);
+      1|            putUlong (i + 24, numEntries);
+      1|            putUlong (i + 32, totalEntries);
+      1|            putUlong (i + 40, directorySize);
+      1|            putUlong (i + 48, directoryOffset);
+      1|            i += eocd64Length;
+       |            
+       |            // Write zip64 end of central directory record locator
+      1|            _data[i .. i + 4] = cast(ubyte[])"PK\x06\x07";
+      1|            putUint  (i + 4,  diskNumber);
+      1|            putUlong (i + 8,  eocd64Offset);
+      1|            putUint  (i + 16, 1);
+      1|            i += eocd64LocLength;
+       |        }
+       |        
+       |        // Write end record
+      5|        endrecOffset = i;
+      5|        _data[i .. i + 4] = cast(ubyte[])"PK\x05\x06";
+      5|        putUshort(i + 4,  cast(ushort)diskNumber);
+      5|        putUshort(i + 6,  cast(ushort)diskStartDir);
+     10|        putUshort(i + 8,  (numEntries > ushort.max ? ushort.max : cast(ushort)numEntries));
+     10|        putUshort(i + 10, (totalEntries > ushort.max ? ushort.max : cast(ushort)totalEntries));
+      5|        putUint  (i + 12, directorySize);
+      5|        putUint  (i + 16, directoryOffset);
+      5|        putUshort(i + 20, cast(ushort)comment.length);
+      5|        i += 22;
+       |
+       |        // Write archive comment
+      5|        assert(i + comment.length == data.length);
+      5|        _data[i .. data.length] = (cast(ubyte[])comment)[];
+       |
+      5|        return cast(void[])data;
+       |    }
+       |
+       |    /* ============ Reading an existing archive =================== */
+       |
+       |    /**
+       |     * Constructor to use when reading an existing archive.
+       |     *
+       |     * Fills in the properties data[], diskNumber, diskStartDir, numEntries,
+       |     * totalEntries, comment[], and directory[].
+       |     * For each ArchiveMember, fills in
+       |     * properties madeVersion, extractVersion, flags, compressionMethod, time,
+       |     * crc32, compressedSize, expandedSize, compressedData[], diskNumber,
+       |     * internalAttributes, externalAttributes, name[], extra[], comment[].
+       |     * Use expand() to get the expanded data for each ArchiveMember.
+       |     *
+       |     * Params:
+       |     *  buffer = the entire contents of the archive.
+       |     */
+       |
+      3|    this(void[] buffer)
+      3|    {   uint iend;
+      3|        uint i;
+      3|        int endcommentlength;
+      3|        uint directorySize;
+      3|        uint directoryOffset;
+       |
+      3|        this._data = cast(ubyte[]) buffer;
+       |
+      3|        if (data.length > uint.max - 2)
+0000000|            throw new ZipException("zip files bigger than 4 GB are unsupported");
+       |        
+       |        // Find 'end record index' by searching backwards for signature
+      6|        iend = (data.length > 66000 ? to!uint(data.length - 66000) : 0);
+      6|        for (i = to!uint(data.length) - 22; 1; i--)
+       |        {
+      6|            if (i < iend || i >= data.length)
+0000000|                throw new ZipException("no end record");
+       |
+      3|            if (_data[i .. i + 4] == cast(ubyte[])"PK\x05\x06")
+       |            {
+      3|                endcommentlength = getUshort(i + 20);
+      3|                if (i + 22 + endcommentlength > data.length
+      3|                        || i + 22 + endcommentlength < i)
+0000000|                    continue;
+      3|                comment = cast(string)(_data[i + 22 .. i + 22 + endcommentlength]);
+      3|                endrecOffset = i;
+       |                
+      3|                uint k = i - eocd64LocLength;
+      6|                if (k < i && _data[k .. k + 4] == cast(ubyte[])"PK\x06\x07")
+       |                {
+      1|                    _isZip64 = true;
+      1|                    i = k;
+       |                }
+       |                
+      3|                break;
+       |            }
+       |        }
+       |
+      3|        if (isZip64)
+       |        {
+       |            // Read Zip64 record data
+      1|            uint eocd64LocStart = i;
+      1|            ulong eocdOffset = getUlong(i + 8);
+      1|            if (eocdOffset + eocd64Length > _data.length)
+0000000|                throw new ZipException("corrupted directory");
+       |            
+      1|            i = to!uint(eocdOffset);
+      1|            if (_data[i .. i + 4] != cast(ubyte[])"PK\x06\x06")
+0000000|                throw new ZipException("invalid Zip EOCD64 signature");
+       |            
+      1|            ulong eocd64Size = getUlong(i + 4);
+      1|            if (eocd64Size + i - 12 > data.length)
+0000000|                throw new ZipException("invalid Zip EOCD64 size");
+       |                
+      1|            _diskNumber = getUint(i + 16);
+      1|            _diskStartDir = getUint(i + 20);
+       |            
+      1|            ulong numEntriesUlong = getUlong(i + 24);
+      1|            ulong totalEntriesUlong = getUlong(i + 32);
+      1|            ulong directorySizeUlong = getUlong(i + 40);
+      1|            ulong directoryOffsetUlong = getUlong(i + 48);
+       |            
+      1|            if (numEntriesUlong > uint.max)
+0000000|                throw new ZipException("supposedly more than 4294967296 files in archive");
+       |            
+      1|            if (numEntriesUlong != totalEntriesUlong)
+0000000|                throw new ZipException("multiple disk zips not supported");
+       |
+      2|            if (directorySizeUlong > i || directoryOffsetUlong > i
+      1|                    || directorySizeUlong + directoryOffsetUlong > i)
+0000000|                throw new ZipException("corrupted directory");
+       |            
+      1|            _numEntries = to!uint(numEntriesUlong);
+      1|            _totalEntries = to!uint(totalEntriesUlong);
+      1|            directorySize = to!uint(directorySizeUlong);
+      1|            directoryOffset = to!uint(directoryOffsetUlong);
+       |        }
+       |        else
+       |        {
+       |        // Read end record data
+      2|        _diskNumber = getUshort(i + 4);
+      2|        _diskStartDir = getUshort(i + 6);
+       |
+      2|        _numEntries = getUshort(i + 8);
+      2|        _totalEntries = getUshort(i + 10);
+       |
+      2|        if (numEntries != totalEntries)
+0000000|            throw new ZipException("multiple disk zips not supported");
+       |
+      2|        directorySize = getUint(i + 12);
+      2|        directoryOffset = getUint(i + 16);
+       |
+      2|        if (directoryOffset + directorySize > i)
+0000000|            throw new ZipException("corrupted directory");
+       |        }
+       |
+      3|        i = directoryOffset;
+     88|        for (int n = 0; n < numEntries; n++)
+       |        {
+       |            /* The format of an entry is:
+       |             *  'PK' 1, 2
+       |             *  directory info
+       |             *  path
+       |             *  extra data
+       |             *  comment
+       |             */
+       |
+     41|            uint offset;
+     41|            uint namelen;
+     41|            uint extralen;
+     41|            uint commentlen;
+       |
+     41|            if (_data[i .. i + 4] != cast(ubyte[])"PK\x01\x02")
+0000000|                throw new ZipException("invalid directory entry 1");
+     41|            ArchiveMember de = new ArchiveMember();
+     41|            de._madeVersion = getUshort(i + 4);
+     41|            de._extractVersion = getUshort(i + 6);
+     41|            de.flags = getUshort(i + 8);
+     41|            de._compressionMethod = cast(CompressionMethod)getUshort(i + 10);
+     41|            de.time = cast(DosFileTime)getUint(i + 12);
+     41|            de._crc32 = getUint(i + 16);
+     41|            de._compressedSize = getUint(i + 20);
+     41|            de._expandedSize = getUint(i + 24);
+     41|            namelen = getUshort(i + 28);
+     41|            extralen = getUshort(i + 30);
+     41|            commentlen = getUshort(i + 32);
+     41|            de._diskNumber = getUshort(i + 34);
+     41|            de.internalAttributes = getUshort(i + 36);
+     41|            de._externalAttributes = getUint(i + 38);
+     41|            de.offset = getUint(i + 42);
+     41|            i += 46;
+       |
+     41|            if (i + namelen + extralen + commentlen > directoryOffset + directorySize)
+0000000|                throw new ZipException("invalid directory entry 2");
+       |
+     41|            de.name = cast(string)(_data[i .. i + namelen]);
+     41|            i += namelen;
+     41|            de.extra = _data[i .. i + extralen];
+     41|            i += extralen;
+     41|            de.comment = cast(string)(_data[i .. i + commentlen]);
+     41|            i += commentlen;
+       |
+     41|            immutable uint dataOffset = de.offset + 30 + namelen + extralen;
+     41|            if (dataOffset + de.compressedSize > endrecOffset)
+0000000|                throw new ZipException("Invalid directory entry offset or size.");
+     41|            de._compressedData = _data[dataOffset .. dataOffset + de.compressedSize];
+       |
+     41|            _directory[de.name] = de;
+       |
+       |        }
+      3|        if (i != directoryOffset + directorySize)
+0000000|            throw new ZipException("invalid directory entry 3");
+       |    }
+       |
+       |    /*****
+       |     * Decompress the contents of archive member de and return the expanded
+       |     * data.
+       |     *
+       |     * Fills in properties extractVersion, flags, compressionMethod, time,
+       |     * crc32, compressedSize, expandedSize, expandedData[], name[], extra[].
+       |     */
+       |    ubyte[] expand(ArchiveMember de)
+     41|    {   uint namelen;
+     41|        uint extralen;
+       |
+     41|        if (_data[de.offset .. de.offset + 4] != cast(ubyte[])"PK\x03\x04")
+0000000|            throw new ZipException("invalid directory entry 4");
+       |
+       |        // These values should match what is in the main zip archive directory
+     41|        de._extractVersion = getUshort(de.offset + 4);
+     41|        de.flags = getUshort(de.offset + 6);
+     41|        de._compressionMethod = cast(CompressionMethod)getUshort(de.offset + 8);
+     41|        de.time = cast(DosFileTime)getUint(de.offset + 10);
+     41|        de._crc32 = getUint(de.offset + 14);
+     41|        de._compressedSize = max(getUint(de.offset + 18), de.compressedSize);
+     41|        de._expandedSize = max(getUint(de.offset + 22), de.expandedSize);
+     41|        namelen = getUshort(de.offset + 26);
+     41|        extralen = getUshort(de.offset + 28);
+       |
+       |        debug(print)
+       |        {
+       |            printf("\t\texpandedSize = %d\n", de.expandedSize);
+       |            printf("\t\tcompressedSize = %d\n", de.compressedSize);
+       |            printf("\t\tnamelen = %d\n", namelen);
+       |            printf("\t\textralen = %d\n", extralen);
+       |        }
+       |
+     41|        if (de.flags & 1)
+0000000|            throw new ZipException("encryption not supported");
+       |
+     41|        int i;
+     41|        i = de.offset + 30 + namelen + extralen;
+     41|        if (i + de.compressedSize > endrecOffset)
+0000000|            throw new ZipException("invalid directory entry 5");
+       |
+     41|        de._compressedData = _data[i .. i + de.compressedSize];
+       |        debug(print) arrayPrint(de.compressedData);
+       |
+     41|        switch (de.compressionMethod)
+       |        {
+      1|            case CompressionMethod.none:
+      1|                de._expandedData = de.compressedData;
+      1|                return de.expandedData;
+       |
+     40|            case CompressionMethod.deflate:
+       |                // -15 is a magic value used to decompress zip files.
+       |                // It has the effect of not requiring the 2 byte header
+       |                // and 4 byte trailer.
+     40|                de._expandedData = cast(ubyte[])std.zlib.uncompress(cast(void[])de.compressedData, de.expandedSize, -15);
+     40|                return de.expandedData;
+       |
+0000000|            default:
+0000000|                throw new ZipException("unsupported compression method");
+       |        }
+       |    }
+       |
+       |    /* ============ Utility =================== */
+       |
+       |    ushort getUshort(int i)
+       |    {
+    585|        ubyte[2] result = data[i .. i + 2];
+    585|        return littleEndianToNative!ushort(result);
+       |    }
+       |
+       |    uint getUint(int i)
+       |    {
+    416|        ubyte[4] result = data[i .. i + 4];
+    416|        return littleEndianToNative!uint(result);
+       |    }
+       |
+       |    ulong getUlong(int i)
+       |    {
+      6|        ubyte[8] result = data[i .. i + 8];
+      6|        return littleEndianToNative!ulong(result);
+       |    }
+       |
+       |    void putUshort(int i, ushort us)
+       |    {
+    629|        data[i .. i + 2] = nativeToLittleEndian(us);
+       |    }
+       |
+       |    void putUint(int i, uint ui)
+       |    {
+    444|        data[i .. i + 4] = nativeToLittleEndian(ui);
+       |    }
+       |
+       |    void putUlong(int i, ulong ul)
+       |    {
+      6|        data[i .. i + 8] = nativeToLittleEndian(ul);
+       |    }
+       |}
+       |
+       |debug(print)
+       |{
+       |    void arrayPrint(ubyte[] array)
+       |    {
+       |        printf("array %p,%d\n", cast(void*)array, array.length);
+       |        for (int i = 0; i < array.length; i++)
+       |        {
+       |            printf("%02x ", array[i]);
+       |            if (((i + 1) & 15) == 0)
+       |                printf("\n");
+       |        }
+       |        printf("\n");
+       |    }
+       |}
+       |
+       |unittest
+       |{
+      1|    auto zip1 = new ZipArchive();
+      1|    auto zip2 = new ZipArchive();
+      1|    auto am1 = new ArchiveMember();
+      1|    am1.name = "foo";
+      1|    am1.expandedData = new ubyte[](1024);
+      1|    zip1.addMember(am1);
+      1|    auto data1 = zip1.build();
+      1|    zip2.addMember(zip1.directory["foo"]);
+      1|    zip2.build();
+      1|    auto am2 = zip2.directory["foo"];
+      1|    zip2.expand(am2);
+      1|    assert(am1.expandedData == am2.expandedData);
+      1|    auto zip3 = new ZipArchive(data1);
+      1|    zip3.build();
+      1|    assert(zip3.directory["foo"].compressedSize == am1.compressedSize);
+       |    
+       |    // Test if packing and unpacking produces the original data
+       |    import std.random : uniform, MinstdRand0;
+       |    import std.stdio, std.conv;
+      1|    MinstdRand0 gen;
+      3|    const uint itemCount = 20, minSize = 10, maxSize = 500;
+      9|    foreach (variant; 0..2)
+       |    {
+      2|        bool useZip64 = !!variant;
+      2|        zip1 = new ZipArchive();
+      2|        zip1.isZip64 = useZip64;
+      2|        ArchiveMember[itemCount] ams;
+    126|        foreach (i; 0..itemCount)
+       |        {
+     40|            ams[i] = new ArchiveMember();
+     40|            ams[i].name = to!string(i);
+     40|            ams[i].expandedData = new ubyte[](uniform(minSize, maxSize));
+  28215|            foreach (ref ubyte c; ams[i].expandedData)
+   9365|                c = cast(ubyte)(uniform(0, 256));
+     40|            ams[i].compressionMethod(CompressionMethod.deflate);
+     40|            zip1.addMember(ams[i]);
+       |        }
+      2|        auto zippedData = zip1.build();
+      2|        zip2 = new ZipArchive(zippedData);
+      2|        assert(zip2.isZip64 == useZip64);
+    126|        foreach (am; ams)
+       |        {
+     40|            am2 = zip2.directory[am.name];
+     40|            zip2.expand(am2);
+     40|            assert(am.crc32 == am2.crc32);
+     40|            assert(am.expandedData == am2.expandedData);
+       |        }
+       |    }
+       |}
+zip.d is 88% covered
